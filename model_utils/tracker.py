@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from functools import wraps
+from contextlib import contextmanager
+from threading import Lock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -26,6 +28,35 @@ if TYPE_CHECKING:
         _deferred_fields: set[str]
 
 T = TypeVar("T")
+
+
+_field_tracking_disabled = False
+_field_tracking_lock = Lock()
+
+
+@contextmanager
+def disable_field_tracking():
+    """
+    A thread-safe context manager that temporarily disables field tracking.
+    Usage:
+        with disable_field_tracking():
+            # Code where field tracking is disabled
+
+    Rationale:
+      - The default FieldTracker had a bug when you used .defer() or .only()
+        as it would try to access all the fields on the model and refresh_from_db() to do so.
+      - If we aren't saving data, we don't need the overhead of the FieldTracker.
+    """
+
+    global _field_tracking_disabled
+    with _field_tracking_lock:
+        original_state = _field_tracking_disabled
+        _field_tracking_disabled = True
+    try:
+        yield
+    finally:
+        with _field_tracking_lock:
+            _field_tracking_disabled = original_state
 
 
 class Descriptor(Protocol[T]):
@@ -92,6 +123,8 @@ class DescriptorWrapper(Generic[T]):
     def __get__(self, instance: models.Model | None, owner: type[models.Model]) -> DescriptorWrapper[T] | T:
         if instance is None:
             return self
+        if _field_tracking_disabled:
+            return instance.__dict__.get(self.field_name)
         was_deferred = self.field_name in instance.get_deferred_fields()
         value = self.descriptor.__get__(instance, owner)
         if was_deferred:
@@ -387,7 +420,7 @@ class FieldTracker:
         instance: models.Model,
         **kwargs: object
     ) -> None:
-        if not isinstance(instance, self.model_class):
+        if not isinstance(instance, self.model_class) or _field_tracking_disabled:
             return  # Only init instances of given model (including children)
         tracker = self.tracker_class(instance, self.fields, self.field_map)
         setattr(instance, self.attname, tracker)
@@ -400,7 +433,8 @@ class FieldTracker:
         @wraps(original)
         def inner(instance: models.Model, *args: Any, **kwargs: Any) -> None:
             original(instance, *args, **kwargs)
-            self.initialize_tracker(model, instance)
+            if not _field_tracking_disabled:
+                self.initialize_tracker(model, instance)
 
         setattr(model, '__init__', inner)
 
@@ -413,6 +447,8 @@ class FieldTracker:
 
         @wraps(original)
         def inner(instance: models.Model, *args: object, **kwargs: Any) -> object:
+            if _field_tracking_disabled:
+                return original(instance, *args, **kwargs)
             update_fields: Iterable[str] | None = kwargs.get(fields_kwarg)
             if update_fields is None:
                 fields = self.fields
